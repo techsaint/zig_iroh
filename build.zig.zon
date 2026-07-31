@@ -1,0 +1,26 @@
+.{
+    .name = .zig_iroh,
+    .version = "0.3.0-alpha",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0x5979a64a8f445f9d,
+    .dependencies = .{
+        .tls = .{
+            .url = "https://github.com/ianic/tls.zig/archive/819ae168d4ea191a768fa1542d66f31f2dcb8327.tar.gz",
+            .hash = "tls-0.1.0-ER2e0pGrBQDyyQ14DfnO03olbgccQGv_lwpUcUmizHcG",
+        },
+        .zigtls = .{ .path = "deps/zigtls" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "deps/picoquic",
+        "deps/picotls",
+        "deps/zigtls",
+        "relay_main.zig",
+        "README.md",
+        "LICENSE-MIT",
+        "LICENSE-APACHE",
+        "NOTICE",
+    },
+}

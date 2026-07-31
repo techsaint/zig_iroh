@@ -1,0 +1,20 @@
+pub const alerts = @import("tls13/alerts.zig");
+pub const certificate_validation = @import("tls13/certificate_validation.zig");
+pub const early_data = @import("tls13/early_data.zig");
+pub const fuzz = @import("tls13/fuzz.zig");
+pub const handshake = @import("tls13/handshake.zig");
+pub const keyschedule = @import("tls13/keyschedule.zig");
+pub const messages = @import("tls13/messages.zig");
+pub const ocsp = @import("tls13/ocsp.zig");
+pub const p256_ecdh = @import("tls13/p256_ecdh.zig");
+pub const record = @import("tls13/record.zig");
+pub const rpk = @import("tls13/rpk.zig");
+pub const session = @import("tls13/session.zig");
+pub const state = @import("tls13/state.zig");
+pub const ticket_keys = @import("tls13/ticket_keys.zig");
+pub const trust_store = @import("tls13/trust_store.zig");
+
+test {
+    _ = p256_ecdh;
+    _ = rpk;
+}
