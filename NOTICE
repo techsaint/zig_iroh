@@ -1,0 +1,25 @@
+zig_iroh — third-party notices
+================================
+
+This source package includes the patched C dependency trees used by the shipping
+picoquic + picotls transport stack:
+
+- picoquic, pinned at 91405da4d966966f74e03ddd89a6bb8be599aa73 — MIT.
+  See `deps/picoquic/LICENSE`. Individual retained source files also carry their
+  own notices where applicable.
+- picotls, pinned at a096f85363edfd9d4f019412232fb6293af504f7 — MIT.
+  See `deps/picotls/README.md`.
+- cifra, included under picotls — CC0-1.0.
+  See `deps/picotls/deps/cifra/COPYING`.
+- micro-ecc, included under picotls — BSD-2-Clause.
+  See `deps/picotls/deps/micro-ecc/LICENSE.txt`.
+- picotls fusion code includes Apache-2.0 and MIT notices in the retained source.
+
+The package links to the host's OpenSSL `libcrypto`; OpenSSL source is not
+included. A build host therefore needs compatible OpenSSL development headers
+and libraries. The hash-pinned `tls.zig` package remains a Zig package-manager
+dependency and may require network access on a cold package cache.
+
+The Zig sources are part of the independent zig_iroh port of iroh and are
+available under MIT OR Apache-2.0. See `LICENSE-MIT` and `LICENSE-APACHE`.
+Upstream iroh (Rust) is MIT/Apache-2.0 dual-licensed by n0.

@@ -1,0 +1,160 @@
+From 73b573361ab5498ad0e8eb5e0a70b021d165db60 Mon Sep 17 00:00:00 2001
+From: Chris <techsaint@gmail.com>
+Date: Mon, 22 Jun 2026 04:09:50 +0000
+Subject: [PATCH 1/2] Handle iroh NAT traversal frames
+
+---
+ picoquic/frames.c | 45 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 45 insertions(+)
+
+diff --git a/picoquic/frames.c b/picoquic/frames.c
+index c51a2680..ef7adc0d 100644
+--- a/picoquic/frames.c
++++ b/picoquic/frames.c
+@@ -25,6 +25,8 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include "picoquic_internal.h"
++
++static const uint8_t* iroh_skip_nat_traversal_frame(const uint8_t* bytes, const uint8_t* bytes_max, uint64_t frame_id64);
+ #include "tls_api.h"
+ 
+ static const size_t challenge_length = 8;
+@@ -6367,6 +6369,33 @@ const uint8_t* picoquic_skip_observed_address_frame(const uint8_t* bytes, const
+     return bytes;
+ }
+ 
++static const uint8_t* iroh_skip_nat_traversal_frame(const uint8_t* bytes, const uint8_t* bytes_max, uint64_t frame_id64)
++{
++    /* This code assumes that the frame type has already been skipped. */
++    if (frame_id64 == 0x3d7f94) {
++        return picoquic_frames_varint_skip(bytes, bytes_max);
++    }
++    if (frame_id64 == 0x3d7f90 || frame_id64 == 0x3d7f92) {
++        if ((bytes = picoquic_frames_varint_skip(bytes, bytes_max)) != NULL && bytes_max - bytes >= 6) {
++            bytes += 6;
++        }
++        else {
++            bytes = NULL;
++        }
++        return bytes;
++    }
++    if (frame_id64 == 0x3d7f91 || frame_id64 == 0x3d7f93) {
++        if ((bytes = picoquic_frames_varint_skip(bytes, bytes_max)) != NULL && bytes_max - bytes >= 18) {
++            bytes += 18;
++        }
++        else {
++            bytes = NULL;
++        }
++        return bytes;
++    }
++    return NULL;
++}
++
+ const uint8_t* picoquic_parse_observed_address_frame(const uint8_t* bytes, const uint8_t* bytes_max,
+     uint64_t ftype, uint64_t* sequence, const uint8_t** addr, uint16_t* port)
+ {
+@@ -6849,6 +6878,14 @@ int picoquic_decode_frames(picoquic_cnx_t* cnx, picoquic_path_t * path_x, const
+                             ack_needed = 1;
+                             bytes = picoquic_decode_observed_address_frame(cnx, bytes, bytes_max, path_x, frame_id64);
+                             break;
++                        case 0x3d7f90:
++                        case 0x3d7f91:
++                        case 0x3d7f92:
++                        case 0x3d7f93:
++                        case 0x3d7f94:
++                            ack_needed = 1;
++                            bytes = iroh_skip_nat_traversal_frame(bytes, bytes_max, frame_id64);
++                            break;
+                         default:
+                             /* Not implemented yet! */
+                             picoquic_connection_error(cnx, PICOQUIC_TRANSPORT_PROTOCOL_VIOLATION, frame_id64);
+@@ -7164,6 +7201,14 @@ int picoquic_skip_frame(const uint8_t* bytes, size_t bytes_maxsize, size_t* cons
+                     bytes = picoquic_skip_observed_address_frame(bytes, bytes_max, frame_id64);
+                     *pure_ack = 0;
+                     break;
++                case 0x3d7f90:
++                case 0x3d7f91:
++                case 0x3d7f92:
++                case 0x3d7f93:
++                case 0x3d7f94:
++                    bytes = iroh_skip_nat_traversal_frame(bytes, bytes_max, frame_id64);
++                    *pure_ack = 0;
++                    break;
+                 default:
+                     /* Not implemented yet! */
+                     bytes = NULL;
+-- 
+2.51.0
+
+
+From 91405da4d966966f74e03ddd89a6bb8be599aa73 Mon Sep 17 00:00:00 2001
+From: Chris <techsaint@gmail.com>
+Date: Mon, 22 Jun 2026 05:19:13 +0000
+Subject: [PATCH 2/2] Deliver iroh NAT traversal frames to callback
+
+---
+ picoquic/frames.c   | 15 ++++++++++++++-
+ picoquic/picoquic.h |  4 +++-
+ 2 files changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/picoquic/frames.c b/picoquic/frames.c
+index ef7adc0d..daf1ad71 100644
+--- a/picoquic/frames.c
++++ b/picoquic/frames.c
+@@ -27,6 +27,7 @@
+ #include "picoquic_internal.h"
+ 
+ static const uint8_t* iroh_skip_nat_traversal_frame(const uint8_t* bytes, const uint8_t* bytes_max, uint64_t frame_id64);
++static const uint8_t* iroh_deliver_nat_traversal_frame(picoquic_cnx_t* cnx, const uint8_t* bytes_before_type, const uint8_t* bytes, const uint8_t* bytes_max, uint64_t frame_id64);
+ #include "tls_api.h"
+ 
+ static const size_t challenge_length = 8;
+@@ -6396,6 +6397,18 @@ static const uint8_t* iroh_skip_nat_traversal_frame(const uint8_t* bytes, const
+     return NULL;
+ }
+ 
++static const uint8_t* iroh_deliver_nat_traversal_frame(picoquic_cnx_t* cnx, const uint8_t* bytes_before_type, const uint8_t* bytes, const uint8_t* bytes_max, uint64_t frame_id64)
++{
++    const uint8_t* bytes_next = iroh_skip_nat_traversal_frame(bytes, bytes_max, frame_id64);
++    if (bytes_next != NULL && cnx->callback_fn != NULL) {
++        if (cnx->callback_fn(cnx, frame_id64, (uint8_t*)bytes_before_type, (size_t)(bytes_next - bytes_before_type),
++            picoquic_callback_iroh_custom_frame, cnx->callback_ctx, NULL) != 0) {
++            bytes_next = NULL;
++        }
++    }
++    return bytes_next;
++}
++
+ const uint8_t* picoquic_parse_observed_address_frame(const uint8_t* bytes, const uint8_t* bytes_max,
+     uint64_t ftype, uint64_t* sequence, const uint8_t** addr, uint16_t* port)
+ {
+@@ -6884,7 +6897,7 @@ int picoquic_decode_frames(picoquic_cnx_t* cnx, picoquic_path_t * path_x, const
+                         case 0x3d7f93:
+                         case 0x3d7f94:
+                             ack_needed = 1;
+-                            bytes = iroh_skip_nat_traversal_frame(bytes, bytes_max, frame_id64);
++                            bytes = iroh_deliver_nat_traversal_frame(cnx, bytes0, bytes, bytes_max, frame_id64);
+                             break;
+                         default:
+                             /* Not implemented yet! */
+diff --git a/picoquic/picoquic.h b/picoquic/picoquic.h
+index d5183546..ed79dceb 100644
+--- a/picoquic/picoquic.h
++++ b/picoquic/picoquic.h
+@@ -357,9 +357,11 @@ typedef enum {
+     picoquic_callback_path_address_observed, /* The peer has reported an address for the path */
+     picoquic_callback_app_wakeup, /* wakeup timer set by application has expired */
+     picoquic_callback_next_path_allowed, /* There are enough path_id and connection ID available for the next path */
+-    picoquic_callback_stream_released /* Stream fully retired: bytes=NULL, len=0,
++    picoquic_callback_stream_released, /* Stream fully retired: bytes=NULL, len=0,
+                                        * stream_ctx = the app_stream_ctx the app set;
+                                        * picoquic will not call back with this stream_ctx again. */
++    picoquic_callback_iroh_custom_frame /* iroh/noq custom QUIC frame received:
++                                         * stream_id=frame type, bytes=full encoded frame, len=frame length. */
+ } picoquic_call_back_event_t;
+ 
+ typedef struct st_picoquic_tp_preferred_address_t {
+-- 
+2.51.0
+

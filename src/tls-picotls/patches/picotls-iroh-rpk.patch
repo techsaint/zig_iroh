@@ -1,0 +1,90 @@
+From a096f85363edfd9d4f019412232fb6293af504f7 Mon Sep 17 00:00:00 2001
+From: Chris <techsaint@gmail.com>
+Date: Sat, 11 Jul 2026 23:34:31 +0000
+Subject: [PATCH] iroh port: RFC-7250 Raw Public Key client_certificate_type
+ (ext 19) negotiation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds the client_certificate_type extension (type 19) with RAW_PUBLIC_KEY,
+tracking the offered cert type through the handshake — iroh's identity model
+(Ed25519 RPK) rides on this. Was an uncommitted working-tree edit on top of
+base 2e80157 (h2o/picotls #604); committing it so the patch has a SHA
+(prereq for the fork+pin release-buildability approach).
+---
+ lib/picotls.c | 23 ++++++++++++++++++++++-
+ 1 file changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/lib/picotls.c b/lib/picotls.c
+index d2da8dd..20bbebd 100644
+--- a/lib/picotls.c
++++ b/lib/picotls.c
+@@ -70,6 +70,7 @@
+ #define PTLS_EXTENSION_TYPE_SUPPORTED_GROUPS 10
+ #define PTLS_EXTENSION_TYPE_SIGNATURE_ALGORITHMS 13
+ #define PTLS_EXTENSION_TYPE_ALPN 16
++#define PTLS_EXTENSION_TYPE_CLIENT_CERTIFICATE_TYPE 19
+ #define PTLS_EXTENSION_TYPE_SERVER_CERTIFICATE_TYPE 20
+ #define PTLS_EXTENSION_TYPE_COMPRESS_CERTIFICATE 27
+ #define PTLS_EXTENSION_TYPE_PRE_SHARED_KEY 41
+@@ -2286,6 +2287,9 @@ static int encode_client_hello(ptls_context_t *ctx, ptls_buffer_t *sendbuf, enum
+                 buffer_push_extension(sendbuf, PTLS_EXTENSION_TYPE_SERVER_CERTIFICATE_TYPE, {
+                     ptls_buffer_push_block(sendbuf, 1, { ptls_buffer_push(sendbuf, PTLS_CERTIFICATE_TYPE_RAW_PUBLIC_KEY); });
+                 });
++                buffer_push_extension(sendbuf, PTLS_EXTENSION_TYPE_CLIENT_CERTIFICATE_TYPE, {
++                    ptls_buffer_push_block(sendbuf, 1, { ptls_buffer_push(sendbuf, PTLS_CERTIFICATE_TYPE_RAW_PUBLIC_KEY); });
++                });
+             }
+             if (ctx->save_ticket != NULL &&
+                 (ctx->ticket_requests.client.new_session_count != 0 || ctx->ticket_requests.client.resumption_count != 0)) {
+@@ -2994,7 +2998,8 @@ static int client_handle_encrypted_extensions(ptls_t *tls, ptls_iovec_t message,
+     ptls_raw_extension_t *unknown_extensions = (ptls_raw_extension_t *)&no_unknown_extensions;
+     int ret, skip_early_data = 1;
+     uint8_t server_offered_cert_type = PTLS_CERTIFICATE_TYPE_X509;
+-
++    uint8_t client_offered_cert_type = PTLS_CERTIFICATE_TYPE_X509;
++ 
+     decode_extensions(src, end, PTLS_HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS, &type, {
+         if (tls->ctx->on_extension != NULL &&
+             (ret = tls->ctx->on_extension->cb(tls->ctx->on_extension, tls, PTLS_HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS, type,
+@@ -3035,6 +3040,14 @@ static int client_handle_encrypted_extensions(ptls_t *tls, ptls_iovec_t message,
+             }
+             skip_early_data = 0;
+             break;
++        case PTLS_EXTENSION_TYPE_CLIENT_CERTIFICATE_TYPE:
++            if (end - src != 1) {
++                ret = PTLS_ALERT_DECODE_ERROR;
++                goto Exit;
++            }
++            client_offered_cert_type = *src;
++            src = end;
++            break;
+         case PTLS_EXTENSION_TYPE_SERVER_CERTIFICATE_TYPE:
+             if (end - src != 1) {
+                 ret = PTLS_ALERT_DECODE_ERROR;
+@@ -3089,6 +3102,12 @@ static int client_handle_encrypted_extensions(ptls_t *tls, ptls_iovec_t message,
+         goto Exit;
+     }
+ 
++    if (client_offered_cert_type != PTLS_CERTIFICATE_TYPE_X509 &&
++        client_offered_cert_type != (tls->ctx->use_raw_public_keys ? PTLS_CERTIFICATE_TYPE_RAW_PUBLIC_KEY : PTLS_CERTIFICATE_TYPE_X509)) {
++        ret = PTLS_ALERT_UNSUPPORTED_CERTIFICATE;
++        goto Exit;
++    }
++
+     if (tls->client.using_early_data) {
+         if (skip_early_data)
+             tls->client.using_early_data = 0;
+@@ -4856,6 +4875,8 @@ static int server_handle_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptl
+             if (tls->ctx->use_raw_public_keys) {
+                 buffer_push_extension(sendbuf, PTLS_EXTENSION_TYPE_SERVER_CERTIFICATE_TYPE,
+                                       { ptls_buffer_push(sendbuf, PTLS_CERTIFICATE_TYPE_RAW_PUBLIC_KEY); });
++                buffer_push_extension(sendbuf, PTLS_EXTENSION_TYPE_CLIENT_CERTIFICATE_TYPE,
++                                      { ptls_buffer_push(sendbuf, PTLS_CERTIFICATE_TYPE_RAW_PUBLIC_KEY); });
+             }
+             if (tls->negotiated_protocol != NULL) {
+                 buffer_push_extension(sendbuf, PTLS_EXTENSION_TYPE_ALPN, {
+-- 
+2.51.0
+

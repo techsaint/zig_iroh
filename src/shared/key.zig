@@ -1,0 +1,658 @@
+//! Cryptographic key handling — ported from iroh.
+//!
+//! Mirrors `iroh/iroh-base/src/key.rs` (n0-computer/iroh, Apache-2.0/MIT).
+//! With wire interop required (plan Q-A = yes), these types must agree
+//! byte-for-byte with iroh:
+//!   - `NodeId` / `PublicKey` is a 32-byte Ed25519 public key.
+//!   - `Display` / `toHex` is lowercase hex; `fmtShort` is the first 5 bytes hex.
+//!   - `parse` mirrors iroh's `FromStr` (`decode_base32_hex`): 64-char
+//!     lowercase hex, or 52-char STANDARD RFC 4648 base32 no-pad (iroh
+//!     `BASE32_NOPAD`). It is NOT z-base-32 — that stays explicit via
+//!     `toZ32`/`fromZ32` for pkarr discovery domain names, exactly as iroh
+//!     separates `FromStr` from `to_z32`/`from_z32`.
+//!   - `SecretKey` is a 32-byte seed; signing is plain Ed25519 (RFC 8032),
+//!     identical to iroh's `ed25519_dalek` deterministic signatures. It offers
+//!     an explicit `zeroize`/`deinit` secure-erase lifecycle (iroh derives
+//!     `ZeroizeOnDrop`); long-lived owners call `deinit` on teardown, since
+//!     Zig has no RAII drop.
+
+const std = @import("std");
+const Ed25519 = std.crypto.sign.Ed25519;
+
+/// z-base-32 alphabet, as used by pkarr / iroh (`iroh-base` `Z_BASE_32`).
+const Z_BASE_32 = "ybndrfg8ejkmcpqxot1uwisza345h769";
+
+/// The stable user-facing key/signature error surface, mirroring iroh-base's
+/// `KeyParsingError` variants one-to-one (plus `BadSignature` for verify):
+/// `InvalidHex` = `FailedToDecodeHex`, `InvalidBase32` = `FailedToDecodeBase32`,
+/// `InvalidLength` = `InvalidLength`, `InvalidPublicKey` = `InvalidKeyData`.
+/// Pinned against the reference by the `parse_class` fixtures in
+/// `shared/iroh_base_fixtures.zig` (generated from the pinned Rust probe).
+pub const KeyError = error{
+    /// The input string could not be decoded as lowercase hex.
+    InvalidHex,
+    /// The input string could not be decoded as base32 (standard or z-base-32).
+    InvalidBase32,
+    /// The input has invalid length for the expected encoding.
+    InvalidLength,
+    /// The decoded data is not a valid Ed25519 public key.
+    InvalidPublicKey,
+    /// Signature verification failed.
+    BadSignature,
+};
+
+/// An Ed25519 public key. This is iroh's `NodeId`/`EndpointId`.
+pub const PublicKey = struct {
+    /// The length of an Ed25519 `PublicKey`, in bytes (iroh `PublicKey::LENGTH`).
+    pub const LENGTH = 32;
+
+    bytes: [32]u8,
+
+    /// Validate and wrap raw bytes (iroh `PublicKey::from_bytes` /
+    /// ed25519-dalek 3.0 `VerifyingKey::from_bytes`). The reference accepts
+    /// every byte string that DECOMPRESSES — including non-canonical y (>= p),
+    /// y = 0, and the identity — and rejects only encodings with no square
+    /// root. Pinned by the `pubkey_validation` fixtures; do NOT add
+    /// canonicality or small-order rejection here.
+    pub fn fromBytes(bytes: [32]u8) KeyError!PublicKey {
+        _ = Ed25519.Curve.fromBytes(bytes) catch return error.InvalidPublicKey;
+        return .{ .bytes = bytes };
+    }
+
+    pub fn toBytes(self: PublicKey) [32]u8 {
+        return self.bytes;
+    }
+
+    pub fn eql(self: PublicKey, other: PublicKey) bool {
+        return std.mem.eql(u8, &self.bytes, &other.bytes);
+    }
+
+    /// Lowercase hex (64 chars), matching iroh's `Display`.
+    pub fn toHex(self: PublicKey) [64]u8 {
+        return std.fmt.bytesToHex(self.bytes, .lower);
+    }
+
+    /// First 5 bytes as lowercase hex (10 chars), matching iroh's `fmt_short`.
+    pub fn fmtShort(self: PublicKey) [10]u8 {
+        return std.fmt.bytesToHex(self.bytes[0..5].*, .lower);
+    }
+
+    /// z-base-32 encoding (52 chars), matching iroh's `to_z32`.
+    pub fn toZ32(self: PublicKey) [52]u8 {
+        var out: [52]u8 = undefined;
+        const n = z32Encode(&self.bytes, &out);
+        std.debug.assert(n == 52);
+        return out;
+    }
+
+    /// Parse a z-base-32 key (iroh `from_z32`).
+    pub fn fromZ32(s: []const u8) KeyError!PublicKey {
+        var raw: [32]u8 = undefined;
+        const n = z32Decode(s, &raw) catch return error.InvalidBase32;
+        if (n != 32) return error.InvalidLength;
+        return fromBytes(raw);
+    }
+
+    /// Parse hex (64 chars) — iroh `Display` is hex, so this round-trips it.
+    /// Like iroh's `HEXLOWER`, only lowercase hex is accepted.
+    pub fn fromHex(s: []const u8) KeyError!PublicKey {
+        if (s.len != 64) return error.InvalidLength;
+        var raw: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&raw, lowerHexChecked(s) orelse return error.InvalidHex) catch unreachable;
+        return fromBytes(raw);
+    }
+
+    /// Parse hex or standard RFC 4648 base32 no-pad, mirroring iroh's
+    /// `FromStr` (`decode_base32_hex`): exactly 64 chars -> lowercase hex (iroh
+    /// `HEXLOWER`, decode failure is `InvalidHex`); otherwise the input must
+    /// decode to exactly 32 bytes via uppercase-normalized standard base32
+    /// no-pad (iroh `BASE32_NOPAD`), which for a 32-byte key is exactly 52
+    /// chars — any other length is `InvalidLength`, a decode failure is
+    /// `InvalidBase32`. z-base-32 is intentionally NOT accepted here — use
+    /// `fromZ32` for discovery/pkarr.
+    pub fn parse(s: []const u8) KeyError!PublicKey {
+        return switch (s.len) {
+            64 => fromHex(s),
+            52 => fromBase32NoPad(s),
+            else => error.InvalidLength,
+        };
+    }
+
+    fn fromBase32NoPad(s: []const u8) KeyError!PublicKey {
+        var raw: [32]u8 = undefined;
+        const n = base32NoPadDecode(s, &raw) catch return error.InvalidBase32;
+        if (n != 32) return error.InvalidLength;
+        return fromBytes(raw);
+    }
+
+    /// Verify a signature over `msg` (iroh's `PublicKey` uses strict verification).
+    pub fn verify(self: PublicKey, msg: []const u8, sig: Signature) KeyError!void {
+        // Build the std key directly: `Ed25519.PublicKey.fromBytes` rejects
+        // non-canonical y encodings that iroh ACCEPTS (see fromBytes above);
+        // the verifier itself only needs the point to decompress.
+        const pk: Ed25519.PublicKey = .{ .bytes = self.bytes };
+        const s = Ed25519.Signature.fromBytes(sig.bytes);
+        s.verifyStrict(msg, pk) catch return error.BadSignature;
+    }
+
+    /// Verify a signature with cofactored/lax Ed25519 verification.
+    pub fn verifyCofactored(self: PublicKey, msg: []const u8, sig: Signature) KeyError!void {
+        const pk: Ed25519.PublicKey = .{ .bytes = self.bytes };
+        const s = Ed25519.Signature.fromBytes(sig.bytes);
+        s.verify(msg, pk) catch return error.BadSignature;
+    }
+};
+
+/// iroh's `NodeId` is exactly its `PublicKey`.
+pub const NodeId = PublicKey;
+
+/// iroh's `EndpointId` is exactly its `PublicKey` (iroh-base key.rs:
+/// `pub type EndpointId = PublicKey`). By convention iroh uses `PublicKey`
+/// when performing cryptographic operations and `EndpointId` when referencing
+/// an endpoint; the Zig port exposes both names for the same type.
+pub const EndpointId = PublicKey;
+
+/// An Ed25519 secret key, stored as a 32-byte seed (iroh `SecretKey`).
+pub const SecretKey = struct {
+    /// The seed lives in a single-field union so Zig 0.16 STRUCTURAL
+    /// formatting (`{}` and `{any}`) prints `.{ ... }` instead of dumping raw
+    /// key material: `std.Io.Writer.printValue` renders auto-layout unions
+    /// opaquely (pinned std Io/Writer.zig union branch `.auto =>
+    /// writeAll(".{ ... }")`) and struct fields are recursed into — no value
+    /// type can otherwise self-redact against the default specifier. Layout
+    /// is unchanged: @sizeOf(SecretKey) == 32, @alignOf(SecretKey) == 1
+    /// (pinned by test). The `{f}` custom format still emits `SecretKey(..)`
+    /// (iroh Debug parity).
+    storage: union { seed: [32]u8 },
+
+    /// Generate a random secret key (iroh `SecretKey::generate`).
+    /// Zig 0.16 has no `std.crypto.random` — use the process Io CSPRNG.
+    pub fn generate(io: std.Io) SecretKey {
+        var seed: [32]u8 = undefined;
+        io.random(&seed);
+        return .{ .storage = .{ .seed = seed } };
+    }
+
+    /// Wrap a 32-byte seed (iroh `SecretKey::from_bytes`).
+    pub fn fromBytes(seed: [32]u8) SecretKey {
+        return .{ .storage = .{ .seed = seed } };
+    }
+
+    pub fn fromHex(s: []const u8) KeyError!SecretKey {
+        if (s.len != 64) return error.InvalidLength;
+        var raw: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&raw, lowerHexChecked(s) orelse return error.InvalidHex) catch unreachable;
+        return fromBytes(raw);
+    }
+
+    /// Parse hex or standard RFC 4648 base32 no-pad, mirroring iroh's
+    /// `SecretKey::FromStr` and the existing `PublicKey.parse` semantics.
+    pub fn parse(s: []const u8) KeyError!SecretKey {
+        return switch (s.len) {
+            64 => fromHex(s),
+            52 => fromBase32NoPad(s),
+            else => error.InvalidLength,
+        };
+    }
+
+    pub fn from_str(s: []const u8) KeyError!SecretKey {
+        return parse(s);
+    }
+
+    fn fromBase32NoPad(s: []const u8) KeyError!SecretKey {
+        var raw: [32]u8 = undefined;
+        const n = base32NoPadDecode(s, &raw) catch return error.InvalidBase32;
+        if (n != 32) return error.InvalidLength;
+        return fromBytes(raw);
+    }
+
+    /// Redacted formatting, matching iroh's `impl Debug for SecretKey`
+    /// (`SecretKey(..)`): formatting/log surfaces never emit seed material.
+    /// Use via `{f}`. A raw-key formatter would print the 64-char seed hex;
+    /// the redacted-format test fails on exactly that mutation.
+    pub fn format(self: SecretKey, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        _ = self;
+        try writer.writeAll("SecretKey(..)");
+    }
+
+    /// The 32-byte seed (iroh `SecretKey::to_bytes`).
+    pub fn toBytes(self: SecretKey) [32]u8 {
+        return self.storage.seed;
+    }
+
+    /// Securely overwrite the secret seed. iroh's `SecretKey` derives
+    /// `zeroize::ZeroizeOnDrop`; Zig has no RAII drop, so long-lived owners
+    /// call this (or `deinit`) on teardown instead of relying on a Drop impl.
+    pub fn zeroize(self: *SecretKey) void {
+        std.crypto.secureZero(u8, &self.storage.seed);
+    }
+
+    /// Explicit teardown hook for long-lived `SecretKey` owners: zeroizes the
+    /// seed. Call from the owner's `deinit`/drop path (e.g. relay client,
+    /// transport, discovery teardown).
+    pub fn deinit(self: *SecretKey) void {
+        self.zeroize();
+    }
+
+    /// The corresponding public key / node id (iroh `SecretKey::public`).
+    pub fn public(self: SecretKey) PublicKey {
+        // Errors only for the ~2^-128 pathological seed; matches iroh's
+        // infallible `public()`.
+        const kp = Ed25519.KeyPair.generateDeterministic(self.storage.seed) catch unreachable;
+        return .{ .bytes = kp.public_key.toBytes() };
+    }
+
+    /// Sign a message — plain Ed25519 (RFC 8032), identical to iroh.
+    pub fn sign(self: SecretKey, msg: []const u8) Signature {
+        const kp = Ed25519.KeyPair.generateDeterministic(self.storage.seed) catch unreachable;
+        const s = kp.sign(msg, null) catch unreachable;
+        return .{ .bytes = s.toBytes() };
+    }
+};
+
+/// A 64-byte Ed25519 signature (iroh `Signature`).
+pub const Signature = struct {
+    /// The length of an Ed25519 `Signature`, in bytes (iroh `Signature::LENGTH`).
+    pub const LENGTH = 64;
+
+    bytes: [64]u8,
+
+    pub fn fromBytes(bytes: [64]u8) Signature {
+        return .{ .bytes = bytes };
+    }
+
+    /// Parse a signature from a byte slice (iroh `TryFrom<&[u8]> for
+    /// `Signature`): exactly 64 bytes, anything else is `InvalidLength`
+    /// (iroh `SignatureParsingError`). Pinned by the `signature_length`
+    /// fixtures.
+    pub fn fromSlice(bytes: []const u8) KeyError!Signature {
+        if (bytes.len != LENGTH) return error.InvalidLength;
+        return .{ .bytes = bytes[0..LENGTH].* };
+    }
+
+    pub fn toBytes(self: Signature) [64]u8 {
+        return self.bytes;
+    }
+
+    pub fn toHex(self: Signature) [128]u8 {
+        return std.fmt.bytesToHex(self.bytes, .lower);
+    }
+
+    /// Parse a signature from lowercase hex (128 chars). Rejects wrong
+    /// length and non-lowercase-hex alphabets, matching iroh's HEXLOWER
+    /// strictness on the public error surface.
+    pub fn fromHex(s: []const u8) KeyError!Signature {
+        if (s.len != 128) return error.InvalidLength;
+        var raw: [64]u8 = undefined;
+        _ = std.fmt.hexToBytes(&raw, lowerHexChecked(s) orelse return error.InvalidHex) catch unreachable;
+        return .{ .bytes = raw };
+    }
+};
+
+/// Returns `s` if it is all lowercase hex (iroh `HEXLOWER` accepts nothing
+/// else), else null. Lets `std.fmt.hexToBytes` keep iroh's case strictness.
+fn lowerHexChecked(s: []const u8) ?[]const u8 {
+    for (s) |c| {
+        if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'))) return null;
+    }
+    return s;
+}
+
+// --- standard RFC 4648 base32, no padding (iroh `BASE32_NOPAD`) ------------
+
+/// Standard RFC 4648 base32 alphabet, no padding. This is what iroh's
+/// `PublicKey`/`SecretKey` `FromStr` decodes (after `to_ascii_uppercase`) via
+/// `data_encoding::BASE32_NOPAD` — distinct from the z-base-32 alphabet used
+/// for discovery/pkarr domain names.
+const BASE32_NOPAD = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+fn base32Symbol(c: u8) ?u5 {
+    // iroh uppercases the input before decoding (`s.to_ascii_uppercase()`), so
+    // accept lowercase too.
+    const upper = std.ascii.toUpper(c);
+    for (BASE32_NOPAD, 0..) |s, i| {
+        if (s == upper) return @intCast(i);
+    }
+    return null;
+}
+
+/// Decode standard RFC 4648 base32 without padding into `out`. Mirrors iroh's
+/// `BASE32_NOPAD.decode_mut`: rejects `=` padding, symbols outside the
+/// alphabet, and non-zero trailing bits (data_encoding's predefined
+/// BASE32_NOPAD sets check_trailing_bits — pinned by the probe's
+/// *_noncanonical_trailing_bits fixtures). Returns the number of bytes written.
+fn base32NoPadDecode(s: []const u8, out: []u8) !usize {
+    var acc: u32 = 0;
+    var nbits: u32 = 0;
+    var oi: usize = 0;
+    for (s) |c| {
+        if (c == '=') return error.InvalidBase32;
+        const v = base32Symbol(c) orelse return error.InvalidBase32;
+        acc = (acc << 5) | v;
+        nbits += 5;
+        if (nbits >= 8) {
+            nbits -= 8;
+            if (oi >= out.len) return error.InvalidBase32;
+            out[oi] = @intCast((acc >> @as(u5, @intCast(nbits))) & 0xff);
+            oi += 1;
+        }
+    }
+    if (nbits > 0) {
+        const mask = (@as(u32, 1) << @as(u5, @intCast(nbits))) - 1;
+        if ((acc & mask) != 0) return error.InvalidBase32;
+    }
+    return oi;
+}
+
+// --- z-base-32 (RFC 4648-style MSB-first bit packing, no padding) ----------
+
+/// Encode `data` into `out` using the z-base-32 alphabet. Returns chars written.
+/// `out` must be at least `(data.len * 8 + 4) / 5` bytes.
+fn z32Encode(data: []const u8, out: []u8) usize {
+    var acc: u32 = 0;
+    var nbits: u32 = 0;
+    var oi: usize = 0;
+    for (data) |b| {
+        acc = (acc << 8) | b;
+        nbits += 8;
+        while (nbits >= 5) {
+            nbits -= 5;
+            out[oi] = Z_BASE_32[(acc >> @as(u5, @intCast(nbits))) & 31];
+            oi += 1;
+        }
+    }
+    if (nbits > 0) {
+        out[oi] = Z_BASE_32[(acc << @as(u5, @intCast(5 - nbits))) & 31];
+        oi += 1;
+    }
+    return oi;
+}
+
+fn z32Symbol(c: u8) ?u5 {
+    for (Z_BASE_32, 0..) |s, i| {
+        if (s == c) return @intCast(i);
+    }
+    return null;
+}
+
+/// Decode z-base-32 `s` into `out`. Returns bytes written. Like iroh's
+/// `Z_BASE_32` (`new_encoding!` defaults check_trailing_bits to true), rejects
+/// non-zero trailing bits.
+fn z32Decode(s: []const u8, out: []u8) !usize {
+    var acc: u32 = 0;
+    var nbits: u32 = 0;
+    var oi: usize = 0;
+    for (s) |c| {
+        const v = z32Symbol(c) orelse return error.InvalidEncoding;
+        acc = (acc << 5) | v;
+        nbits += 5;
+        if (nbits >= 8) {
+            nbits -= 8;
+            if (oi >= out.len) return error.InvalidEncoding;
+            out[oi] = @intCast((acc >> @as(u5, @intCast(nbits))) & 0xff);
+            oi += 1;
+        }
+    }
+    if (nbits > 0) {
+        const mask = (@as(u32, 1) << @as(u5, @intCast(nbits))) - 1;
+        if ((acc & mask) != 0) return error.InvalidEncoding;
+    }
+    return oi;
+}
+
+// --- tests -----------------------------------------------------------------
+// Vectors are RFC 8032 ground truth (python-cryptography), which iroh's
+// ed25519_dalek also implements. The z32 + iroh public-key vector come from
+// `iroh/iroh-base/src/key.rs` (`ae58...502b6`).
+
+const testing = std.testing;
+const fixtures = @import("iroh_base_fixtures.zig");
+
+fn hexToArr(comptime n: usize, s: *const [n * 2]u8) [n]u8 {
+    var out: [n]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, s) catch unreachable;
+    return out;
+}
+
+test "seed -> public key matches Ed25519 (RFC 8032) ground truth" {
+    const sk = SecretKey.fromBytes(hexToArr(32, "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"));
+    const pk = sk.public();
+    try testing.expectEqualStrings(
+        "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+        &pk.toHex(),
+    );
+}
+
+test "sign produces the iroh/RFC-8032 signature and verifies" {
+    const sk = SecretKey.fromBytes(hexToArr(32, "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"));
+    const sig = sk.sign("iroh zig port");
+    try testing.expectEqualStrings(
+        "0ab61f64e471010532cd01f223a7256c0a88daa59ba3e5e2f4f0b464dcde678a" ++
+            "4c7fd771e820db345d5096f1f72c41d888fde74ab84cc9ee7649724af7f76c08",
+        &sig.toHex(),
+    );
+    try sk.public().verify("iroh zig port", sig);
+}
+
+test "verify rejects a tampered message" {
+    const sk = SecretKey.fromBytes(hexToArr(32, "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"));
+    const sig = sk.sign("iroh zig port");
+    try testing.expectError(error.BadSignature, sk.public().verify("iroh zig porT", sig));
+}
+
+test "verify is strict while verifyCofactored accepts cofactored-only signatures" {
+    const msg = hexToArr(16, "65643235353139766563746f72732033"); // "ed25519vectors 3"
+    const pk = try PublicKey.fromHex("86e72f5c2a7215151059aa151c0ee6f8e2155d301402f35d7498f078629a8f79");
+    const sig = Signature.fromBytes(hexToArr(64, "fa9dde274f4820efb19a890f8ba2d8791710a4303ceef4aedf9dddc4e81a1f11701a598b9a02ae60505dd0c2938a1a0c2d6ffd4676cfb49125b19e9cb358da06"));
+
+    try pk.verifyCofactored(&msg, sig);
+    try testing.expectError(error.BadSignature, pk.verify(&msg, sig));
+}
+
+test "public key z-base-32 round-trips and matches the seed vector" {
+    const pk = SecretKey.fromBytes(hexToArr(32, "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")).public();
+    try testing.expectEqualStrings("yqooxx9u3aemh8mo5wcqq16yufu6jitouq1o4za751dger1igghy", &pk.toZ32());
+    const back = try PublicKey.fromZ32(&pk.toZ32());
+    try testing.expect(back.eql(pk));
+}
+
+test "iroh public-key vector: parse accepts hex and standard base32 only" {
+    // The hex + iroh public-key vector come from `iroh-base/src/key.rs`
+    // (`ae58...502b6`). The 52-char base32 string is the RFC 4648 no-pad
+    // encoding of those bytes — the same string iroh's `BASE32_NOPAD` accepts.
+    const hex = "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6";
+    const base32 = "VZMP7CBTEQNMQLLP65QRARXNM62QOLIUFRMI2ADD5FBNTJ2VAK3A";
+    const pk = try PublicKey.fromHex(hex);
+    try testing.expectEqualStrings(hex, &pk.toHex());
+    try testing.expectEqualStrings("i3cx9nburopcommx67otytzpc64oqmewftce4ydd7fbpuj4iyk5y", &pk.toZ32());
+    try testing.expect((try PublicKey.parse(hex)).eql(pk));
+    // 52-char STANDARD base32 (uppercase) parses, matching iroh FromStr.
+    try testing.expect((try PublicKey.parse(base32)).eql(pk));
+    // iroh uppercases before decoding, so lowercase standard base32 parses too.
+    try testing.expect((try PublicKey.parse("vzmp7cbteqnmqllp65qrarxnm62qoliufrmi2add5fbntj2vak3a")).eql(pk));
+    // z-base-32 is NOT standard base32: parse must reject it (iroh:
+    // `FailedToDecodeBase32`).
+    try testing.expectError(error.InvalidBase32, PublicKey.parse(&pk.toZ32()));
+    // z-base-32 origins still resolve through the EXPLICIT fromZ32 path.
+    try testing.expect((try PublicKey.fromZ32(&pk.toZ32())).eql(pk));
+}
+
+test "fmtShort is first 5 bytes of hex" {
+    const pk = try PublicKey.fromHex("ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6");
+    try testing.expectEqualStrings("ae58ff8833", &pk.fmtShort());
+}
+
+test "PublicKey.fromBytes acceptance set matches the iroh reference (fixture-driven)" {
+    // iroh-base 1.0.0 (ed25519-dalek 3.0) accepts every encoding that
+    // DECOMPRESSES — including all-0xFF (non-canonical y), the identity, and
+    // y == p — and rejects only encodings with no square root. Mutation-RED:
+    // re-adding a canonicality/small-order rejection flips the accepted cases
+    // red; dropping the decompression check flips no_square_root red.
+    for (fixtures.pubkey_validation) |case| {
+        const bytes = hexToArr(32, case.hex[0..64]);
+        const result = PublicKey.fromBytes(bytes);
+        if (case.accepted) {
+            const pk = try result;
+            try testing.expectEqual(bytes, pk.toBytes());
+        } else {
+            try testing.expectError(error.InvalidPublicKey, result);
+        }
+    }
+}
+
+test "verify still behaves on reference-accepted non-canonical keys" {
+    // Keys iroh accepts at parse time must flow through verify: the verifier
+    // fails the equation (BadSignature), never rejects the key encoding.
+    const pk = try PublicKey.fromBytes(.{0xff} ** 32);
+    const sk = SecretKey.fromBytes(hexToArr(32, "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"));
+    const sig = sk.sign("iroh zig port");
+    try testing.expectError(error.BadSignature, pk.verify("iroh zig port", sig));
+}
+
+test "parse error classification matches the iroh reference (fixture-driven)" {
+    // Every case is generated by the pinned Rust probe; `expected` is the Zig
+    // KeyError member carrying the same class as iroh's KeyParsingError
+    // Display string. Mutation-RED: collapsing the error surface back to one
+    // generic InvalidEncoding fails the specific-member expectations.
+    for (fixtures.parse_class) |case| {
+        if (case.via == .from_z32) {
+            const result = PublicKey.fromZ32(case.input);
+            if (case.expected) |expected| {
+                try testing.expectError(expected, result);
+            } else {
+                _ = try result;
+            }
+        } else if (case.secret) {
+            const result = SecretKey.parse(case.input);
+            if (case.expected) |expected| {
+                try testing.expectError(expected, result);
+            } else {
+                _ = try result;
+            }
+        } else {
+            const result = PublicKey.parse(case.input);
+            if (case.expected) |expected| {
+                try testing.expectError(expected, result);
+            } else if (std.mem.eql(u8, case.name, "hex_lower_ok")) {
+                // The canonical form renders back to the probe's public key.
+                try testing.expectEqualStrings(fixtures.postcard.public_hex, &(try result).toHex());
+            } else {
+                _ = try result;
+            }
+        }
+    }
+}
+
+test "SecretKey formatting is redacted (iroh Debug parity)" {
+    const sk = SecretKey.fromBytes(hexToArr(32, "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"));
+    const text = try std.fmt.allocPrint(testing.allocator, "{f}", .{sk});
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings(fixtures.display.secret_debug, text);
+    // Mutation-RED: a formatter emitting raw key material contains the seed hex.
+    const seed_hex = std.fmt.bytesToHex(sk.toBytes(), .lower);
+    try testing.expect(std.mem.indexOf(u8, text, &seed_hex) == null);
+}
+
+test "SecretKey structural formatting ({}/{any}) cannot dump raw key material" {
+    // Zig 0.16 std.Io.Writer.printValue recurses into struct fields for `{}`
+    // and `{any}` and IGNORES custom format methods — an unwrapped `[32]u8`
+    // seed field dumps as decimal bytes (`.{ .seed = { 90, 90, ... } }`).
+    // The single-field union wrap renders opaquely (`.{ ... }`) because
+    // auto-layout unions are not traversed. Layout pin: the wrap must not
+    // change the value representation.
+    try testing.expectEqual(@as(usize, 32), @sizeOf(SecretKey));
+    try testing.expectEqual(@as(usize, 1), @alignOf(SecretKey));
+
+    const sk = SecretKey.fromBytes(.{0x5a} ** 32);
+    // Mutation-RED: with a plain `seed: [32]u8` field both structural dumps
+    // contain the decimal byte run "90, 90" and this test fails.
+    inline for (.{ "{}", "{any}" }) |spec| {
+        const text = try std.fmt.allocPrint(testing.allocator, spec, .{sk});
+        defer testing.allocator.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "90, 90") == null);
+        try testing.expect(std.mem.indexOf(u8, text, ".{ ... }") != null);
+    }
+}
+
+test "SecretKey zeroize/deinit scrubs the seed (iroh ZeroizeOnDrop boundary)" {
+    // Zig has no RAII drop; `zeroize`/`deinit` IS the ownership-boundary scrub
+    // the Zig API exposes (called from endpoint/transport/relay teardown).
+    // Mutation-RED: removing the secureZero body leaves the seed intact and
+    // this test fails.
+    var sk = SecretKey.fromBytes(.{0x5a} ** 32);
+    sk.zeroize();
+    try testing.expectEqual(@as([32]u8, .{0} ** 32), sk.toBytes());
+
+    var sk2 = SecretKey.fromBytes(.{0xa5} ** 32);
+    sk2.deinit();
+    try testing.expectEqual(@as([32]u8, .{0} ** 32), sk2.toBytes());
+}
+
+test "EndpointId is the user-facing endpoint identity name for PublicKey" {
+    // iroh-base key.rs: `pub type EndpointId = PublicKey` — used when
+    // referencing an endpoint rather than doing crypto. Exercise the alias in
+    // user-shaped code: values flow through both names and crypto still works.
+    const sk = SecretKey.fromBytes(.{0x42} ** 32);
+    const id: EndpointId = sk.public();
+    const pk: PublicKey = id; // same type, both names
+    const sig = sk.sign("endpoint");
+    try pk.verify("endpoint", sig);
+    try testing.expectEqualStrings(&pk.toHex(), &id.toHex());
+}
+
+test "Signature.fromSlice length behavior matches the reference (fixture-driven)" {
+    const sig_bytes = hexToArr(64, fixtures.signature_bytes_hex[0..128]);
+    for (fixtures.signature_length) |case| {
+        var buf: [65]u8 = undefined;
+        @memcpy(buf[0..64], &sig_bytes);
+        buf[64] = 0;
+        const result = Signature.fromSlice(buf[0..case.len]);
+        if (case.ok) {
+            const sig = try result;
+            try testing.expectEqual(sig_bytes, sig.toBytes());
+        } else {
+            try testing.expectError(error.InvalidLength, result);
+        }
+    }
+}
+
+test "Signature.fromHex round-trips and rejects malformed input" {
+    const sig_bytes = hexToArr(64, fixtures.signature_bytes_hex[0..128]);
+    const sig = Signature.fromBytes(sig_bytes);
+    const hex = sig.toHex();
+    const parsed = try Signature.fromHex(&hex);
+    try testing.expectEqual(sig_bytes, parsed.toBytes());
+
+    try testing.expectError(error.InvalidLength, Signature.fromHex("abcd"));
+    try testing.expectError(error.InvalidHex, Signature.fromHex(&[_]u8{'G'} ** 128));
+    var upper = hex;
+    for (&upper) |*c| c.* = std.ascii.toUpper(c.*);
+    try testing.expectError(error.InvalidHex, Signature.fromHex(&upper));
+}
+
+test "SecretKey.generate fills from Io CSPRNG and is non-zero" {
+    const sk = SecretKey.generate(std.testing.io);
+    // Astronomically unlikely all-zero from a real CSPRNG; catches the old stub.
+    try testing.expect(!std.mem.eql(u8, &sk.toBytes(), &[_]u8{0} ** 32));
+    const sk2 = SecretKey.generate(std.testing.io);
+    try testing.expect(!std.mem.eql(u8, &sk.toBytes(), &sk2.toBytes()));
+}
+
+test "secret key parse accepts hex and standard base32 preserving public key" {
+    const seed_hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    const seed_base32 = "AAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYPQ";
+    const expected = SecretKey.fromBytes(hexToArr(32, seed_hex));
+
+    const from_hex = try SecretKey.parse(seed_hex);
+    try testing.expectEqual(expected.toBytes(), from_hex.toBytes());
+    try testing.expect(from_hex.public().eql(expected.public()));
+
+    const from_base32 = try SecretKey.from_str(seed_base32);
+    try testing.expectEqual(expected.toBytes(), from_base32.toBytes());
+    try testing.expect(from_base32.public().eql(expected.public()));
+    try testing.expect((try SecretKey.parse("aaaqeayeaudaocajbifqydiob4ibceqtcqkrmfyydenbwha5dypq")).public().eql(expected.public()));
+    // A 53-char padded string is the wrong length (iroh: `InvalidLength`).
+    try testing.expectError(error.InvalidLength, SecretKey.parse("AAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYPQ="));
+    // 52-char with embedded padding decodes no further (iroh: `FailedToDecodeBase32`).
+    try testing.expectError(error.InvalidBase32, SecretKey.parse("AAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DY=Q"));
+}
